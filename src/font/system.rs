@@ -179,6 +179,270 @@ impl fmt::Debug for FontSystem {
     }
 }
 
+/// The persistent on-disk system-font index cache used when loading system fonts.
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, Default)]
+enum SystemFontsCache {
+    /// Scan the system font directories on every start.
+    #[default]
+    Disabled,
+    /// Use the cache at [`FontSystem::default_cache_path`].
+    DefaultPath,
+    /// Use the cache at an explicitly provided path.
+    Path(std::path::PathBuf),
+}
+
+/// A builder for [`FontSystem`] with the following default configuration:
+///
+/// * Use the system locale on `std` or `en-US` on `no_std`
+/// * Load system fonts, without a persistent on-disk cache
+/// * Use `Noto Sans Mono` as the monospace family
+/// * Use `Open Sans` as the sans-serif family
+/// * Use `DejaVu Serif` as the serif family
+/// * Use a platform-specific font fallback
+///
+/// Passing a database to [`FontSystemBuilder::database`] changes those defaults: the database is
+/// then used as-is, so system fonts are not loaded into it and the font families it already has
+/// configured are left alone. Both can still be requested explicitly with
+/// [`FontSystemBuilder::load_system_fonts`] and the family setters.
+///
+/// # Timing
+///
+/// When system fonts are loaded (the default when no database is provided) building takes some
+/// time. On the release build, it can take up to a second, while debug builds can take up to ten
+/// times longer. For this reason, it should only be built once, and the resulting [`FontSystem`]
+/// should be shared.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```no_run
+/// # macro_rules! include_bytes { ($e:expr) => {[]} }
+/// use std::sync::Arc;
+/// use cosmic_text::FontSystem;
+/// use cosmic_text::fontdb::Source;
+///
+/// let font = Source::Binary(Arc::new(include_bytes!("Roboto.ttf")));
+/// FontSystem::builder()
+///     .locale(Some("fr-FR"))
+///     .load_font(font)
+///     .build();
+/// ```
+pub struct FontSystemBuilder {
+    locale: Option<String>,
+    #[cfg(feature = "std")]
+    load_system_fonts: Option<bool>,
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    system_fonts_cache: SystemFontsCache,
+    database: Option<fontdb::Database>,
+    fonts: Vec<fontdb::Source>,
+    monospace_family: Option<String>,
+    sans_serif_family: Option<String>,
+    serif_family: Option<String>,
+    dyn_fallback: Option<Box<dyn Fallback>>,
+}
+
+impl fmt::Debug for FontSystemBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("FontSystemBuilder");
+        s.field("locale", &self.locale);
+        #[cfg(feature = "std")]
+        s.field("load_system_fonts", &self.load_system_fonts);
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        s.field("system_fonts_cache", &self.system_fonts_cache);
+        s.field("database", &self.database)
+            .field("fonts", &self.fonts)
+            .field("monospace_family", &self.monospace_family)
+            .field("sans_serif_family", &self.sans_serif_family)
+            .field("serif_family", &self.serif_family)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for FontSystemBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FontSystemBuilder {
+    /// Family used by `Family::Monospace` unless another one is configured.
+    const DEFAULT_MONOSPACE_FAMILY: &'static str = "Noto Sans Mono";
+
+    /// Family used by `Family::SansSerif` unless another one is configured.
+    const DEFAULT_SANS_SERIF_FAMILY: &'static str = "Open Sans";
+
+    /// Family used by `Family::Serif` unless another one is configured.
+    const DEFAULT_SERIF_FAMILY: &'static str = "DejaVu Serif";
+
+    fn new() -> Self {
+        Self {
+            locale: None,
+            #[cfg(feature = "std")]
+            load_system_fonts: None,
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+            system_fonts_cache: SystemFontsCache::Disabled,
+            database: None,
+            fonts: Vec::new(),
+            monospace_family: None,
+            sans_serif_family: None,
+            serif_family: None,
+            dyn_fallback: None,
+        }
+    }
+
+    /// Consume the builder and create the [`FontSystem`]
+    pub fn build(self) -> FontSystem {
+        FontSystem::new_from_builder(self)
+    }
+
+    /// Specify the locale that will be used for font fallback or [`None`] for the default.
+    ///
+    /// Default: the system locale on `std` or `en-US` on `no_std`
+    pub fn locale(mut self, value: Option<impl Into<String>>) -> Self {
+        self.locale = value.map(Into::into);
+        self
+    }
+
+    /// Enable loading all system fonts.
+    ///
+    /// Default: enabled, unless a database was provided with [`FontSystemBuilder::database`]
+    #[cfg(feature = "std")]
+    pub fn load_system_fonts(mut self, enabled: bool) -> Self {
+        self.load_system_fonts = Some(enabled);
+        self
+    }
+
+    /// Load the system fonts through a persistent on-disk index cache stored at the default
+    /// platform location (see [`FontSystem::default_cache_path`]).
+    ///
+    /// On a cache hit no font file is parsed, which makes loading the system fonts considerably
+    /// faster. A stale or unreadable cache falls back to a normal scan and is then rewritten. If
+    /// no cache directory can be determined the system fonts are loaded without a cache.
+    ///
+    /// This only affects system fonts, the sources added with [`FontSystemBuilder::load_font`] and
+    /// [`FontSystemBuilder::load_fonts`] are always loaded fresh and never persisted to the cache.
+    ///
+    /// Calling this replaces any path previously set with
+    /// [`FontSystemBuilder::system_fonts_cache_path`].
+    ///
+    /// Default: disabled
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    pub fn system_fonts_cache(mut self, enabled: bool) -> Self {
+        self.system_fonts_cache = if enabled {
+            SystemFontsCache::DefaultPath
+        } else {
+            SystemFontsCache::Disabled
+        };
+        self
+    }
+
+    /// Like [`FontSystemBuilder::system_fonts_cache`], but stores the persistent system-font index
+    /// cache at the provided path instead of the default platform location.
+    ///
+    /// Calling this enables the cache.
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    pub fn system_fonts_cache_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.system_fonts_cache = SystemFontsCache::Path(path.into());
+        self
+    }
+
+    /// Use the specified font database instead of a new one.
+    ///
+    /// The database is used as-is: system fonts are not loaded into it and the font families it
+    /// has configured are kept, unless [`FontSystemBuilder::load_system_fonts`] or the family
+    /// setters are called explicitly.
+    pub fn database(mut self, value: Option<fontdb::Database>) -> Self {
+        self.database = value;
+        self
+    }
+
+    /// Load an additional font
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # macro_rules! include_bytes { ($e:expr) => {[]} }
+    /// use std::sync::Arc;
+    /// use cosmic_text::FontSystem;
+    /// use cosmic_text::fontdb::Source;
+    ///
+    /// FontSystem::builder()
+    ///     .load_font(Source::Binary(Arc::new(include_bytes!("Roboto-Regular.ttf"))))
+    ///     .load_font(Source::File("./Roboto-Bold.ttf".into()))
+    ///     .build();
+    /// ```
+    pub fn load_font(mut self, source: fontdb::Source) -> Self {
+        self.fonts.push(source);
+        self
+    }
+
+    /// Load additional fonts
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # macro_rules! include_bytes { ($e:expr) => {[]} }
+    /// use std::sync::Arc;
+    /// use cosmic_text::FontSystem;
+    /// use cosmic_text::fontdb::Source;
+    ///
+    /// FontSystem::builder()
+    ///     .load_fonts([
+    ///         Source::Binary(Arc::new(include_bytes!("Roboto-Regular.ttf"))),
+    ///         Source::File("./Roboto-Bold.ttf".into())
+    ///     ])
+    ///     .build();
+    /// ```
+    pub fn load_fonts(mut self, sources: impl IntoIterator<Item = fontdb::Source>) -> Self {
+        self.fonts.extend(sources);
+        self
+    }
+
+    /// Sets the family that will be used by `Family::Monospace`.
+    ///
+    /// Default: `Noto Sans Mono`, or the database's own setting when one was provided with
+    /// [`FontSystemBuilder::database`]
+    pub fn monospace_family(mut self, value: impl Into<String>) -> Self {
+        self.monospace_family = Some(value.into());
+        self
+    }
+
+    /// Sets the family that will be used by `Family::SansSerif`.
+    ///
+    /// Default: `Open Sans`, or the database's own setting when one was provided with
+    /// [`FontSystemBuilder::database`]
+    pub fn sans_serif_family(mut self, value: impl Into<String>) -> Self {
+        self.sans_serif_family = Some(value.into());
+        self
+    }
+
+    /// Sets the family that will be used by `Family::Serif`.
+    ///
+    /// Default: `DejaVu Serif`, or the database's own setting when one was provided with
+    /// [`FontSystemBuilder::database`]
+    pub fn serif_family(mut self, value: impl Into<String>) -> Self {
+        self.serif_family = Some(value.into());
+        self
+    }
+
+    /// Sets the font fallback implementation
+    ///
+    /// Default: [`PlatformFallback`]
+    pub fn dyn_fallback(mut self, fallback: Option<Box<dyn Fallback>>) -> Self {
+        self.dyn_fallback = fallback;
+        self
+    }
+
+    /// Sets the font fallback implementation
+    ///
+    /// Default: [`PlatformFallback`]
+    pub fn fallback(self, fallback: impl Fallback + 'static) -> Self {
+        self.dyn_fallback(Some(Box::new(fallback)))
+    }
+}
+
 impl FontSystem {
     const FONT_MATCHES_CACHE_SIZE_LIMIT: usize = 256;
     /// Create a new [`FontSystem`], that allows access to any installed system fonts
@@ -189,14 +453,12 @@ impl FontSystem {
     /// while debug builds can take up to ten times longer. For this reason, it should only be
     /// called once, and the resulting [`FontSystem`] should be shared.
     pub fn new() -> Self {
-        Self::new_with_fonts(core::iter::empty())
+        Self::builder().build()
     }
 
     /// Create a new [`FontSystem`] with a pre-specified set of fonts.
     pub fn new_with_fonts(fonts: impl IntoIterator<Item = fontdb::Source>) -> Self {
-        let mut db = fontdb::Database::new();
-        Self::load_fonts(&mut db, fonts.into_iter());
-        Self::finish_with_db(db)
+        Self::builder().load_fonts(fonts).build()
     }
 
     /// Create a new [`FontSystem`] backed by a persistent on-disk system-font index cache
@@ -206,7 +468,7 @@ impl FontSystem {
     /// Falls back to a normal, uncached scan if no cache directory can be determined.
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     pub fn new_cached() -> Self {
-        Self::new_with_fonts_and_cache(core::iter::empty())
+        Self::builder().system_fonts_cache(true).build()
     }
 
     /// Returns the default system-font cache file path used by [`FontSystem::new_cached`]
@@ -233,7 +495,10 @@ impl FontSystem {
     /// [`FontSystem::new_with_fonts_and_cache_path`].
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     pub fn new_with_fonts_and_cache(fonts: impl IntoIterator<Item = fontdb::Source>) -> Self {
-        Self::new_with_fonts_and_cache_inner(fonts, Self::default_cache_path())
+        Self::builder()
+            .system_fonts_cache(true)
+            .load_fonts(fonts)
+            .build()
     }
 
     /// Like [`FontSystem::new_with_fonts_and_cache`], but uses the persistent system-font
@@ -244,54 +509,110 @@ impl FontSystem {
         fonts: impl IntoIterator<Item = fontdb::Source>,
         cache_path: std::path::PathBuf,
     ) -> Self {
-        Self::new_with_fonts_and_cache_inner(fonts, Some(cache_path))
+        Self::builder()
+            .system_fonts_cache_path(cache_path)
+            .load_fonts(fonts)
+            .build()
     }
 
-    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-    fn new_with_fonts_and_cache_inner(
-        fonts: impl IntoIterator<Item = fontdb::Source>,
-        cache_path: Option<std::path::PathBuf>,
-    ) -> Self {
-        let mut db = fontdb::Database::new();
+    /// Create a builder for [`FontSystem`] with the following default configuration:
+    ///
+    /// * Use the system locale on `std` or `en-US` on `no_std`
+    /// * Load system fonts, without a persistent on-disk cache
+    /// * Use `Noto Sans Mono` as the monospace family
+    /// * Use `Open Sans` as the sans-serif family
+    /// * Use `DejaVu Serif` as the serif family
+    /// * Use a platform-specific font fallback
+    ///
+    /// See [`FontSystemBuilder`] for the available options.
+    ///
+    /// # Timing
+    ///
+    /// When system fonts are loaded (the default when no database is provided) building takes
+    /// some time. On the release build, it can take up to a second, while debug builds can take
+    /// up to ten times longer. For this reason, it should only be built once, and the resulting
+    /// [`FontSystem`] should be shared.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```no_run
+    /// # macro_rules! include_bytes { ($e:expr) => {[]} }
+    /// use std::sync::Arc;
+    /// use cosmic_text::FontSystem;
+    /// use cosmic_text::fontdb::Source;
+    ///
+    /// let font = Source::Binary(Arc::new(include_bytes!("Roboto.ttf")));
+    /// FontSystem::builder()
+    ///     .locale(Some("fr-FR"))
+    ///     .load_font(font)
+    ///     .build();
+    /// ```
+    pub fn builder() -> FontSystemBuilder {
+        FontSystemBuilder::new()
+    }
 
+    /// Load the fonts described by the builder and finish constructing the [`FontSystem`].
+    fn new_from_builder(builder: FontSystemBuilder) -> Self {
+        // A database provided by the caller is used as-is: neither the system fonts nor the
+        // default families are applied to it unless they were requested explicitly.
+        let apply_defaults = builder.database.is_none();
+
+        let locale = builder.locale.unwrap_or_else(Self::get_locale);
+        log::debug!("Locale: {locale}");
+
+        let mut db = builder.database.unwrap_or_default();
+
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         let now = std::time::Instant::now();
 
-        match cache_path {
-            Some(cache_path) => super::cache::load_system_fonts_cached(&mut db, &cache_path),
-            None => db.load_system_fonts(),
+        #[cfg(feature = "std")]
+        if builder.load_system_fonts.unwrap_or(apply_defaults) {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::load_system_fonts(&mut db, &builder.system_fonts_cache);
+            #[cfg(target_arch = "wasm32")]
+            db.load_system_fonts();
         }
-        for source in fonts {
+
+        for source in builder.fonts {
             db.load_font_source(source);
         }
 
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         log::debug!(
-            "Loaded {} font faces in {}ms.",
+            "Parsed {} font faces in {}ms.",
             db.len(),
             now.elapsed().as_millis()
         );
 
-        Self::finish_with_db(db)
+        if let Some(family) = builder.monospace_family.or_else(|| {
+            apply_defaults.then(|| String::from(FontSystemBuilder::DEFAULT_MONOSPACE_FAMILY))
+        }) {
+            db.set_monospace_family(family);
+        }
+        if let Some(family) = builder.sans_serif_family.or_else(|| {
+            apply_defaults.then(|| String::from(FontSystemBuilder::DEFAULT_SANS_SERIF_FAMILY))
+        }) {
+            db.set_sans_serif_family(family);
+        }
+        if let Some(family) = builder.serif_family.or_else(|| {
+            apply_defaults.then(|| String::from(FontSystemBuilder::DEFAULT_SERIF_FAMILY))
+        }) {
+            db.set_serif_family(family);
+        }
+
+        let dyn_fallback = builder
+            .dyn_fallback
+            .unwrap_or_else(|| Box::new(PlatformFallback));
+
+        Self::new_with_locale_and_db_and_dyn_fallback(locale, db, dyn_fallback)
     }
 
-    /// Apply the default font families and finish constructing the [`FontSystem`] from a
-    /// loaded font database.
-    fn finish_with_db(mut db: fontdb::Database) -> Self {
-        let locale = Self::get_locale();
-        log::debug!("Locale: {locale}");
-
-        //TODO: configurable default fonts
-        db.set_monospace_family("Noto Sans Mono");
-        db.set_sans_serif_family("Open Sans");
-        db.set_serif_family("DejaVu Serif");
-
-        Self::new_with_locale_and_db_and_fallback(locale, db, PlatformFallback)
-    }
-
-    /// Create a new [`FontSystem`] with a pre-specified locale, font database and font fallback list.
-    pub fn new_with_locale_and_db_and_fallback(
+    fn new_with_locale_and_db_and_dyn_fallback(
         locale: String,
         db: fontdb::Database,
-        impl_fallback: impl Fallback + 'static,
+        dyn_fallback: Box<dyn Fallback>,
     ) -> Self {
         let mut monospace_font_ids = db
             .faces()
@@ -331,7 +652,7 @@ impl FontSystem {
             .map(|(k, v)| (k, Vec::from_iter(v)))
             .collect();
 
-        let fallbacks = Fallbacks::new(&impl_fallback, &[], &locale);
+        let fallbacks = Fallbacks::new(&*dyn_fallback, &[], &locale);
 
         Self {
             locale,
@@ -345,14 +666,36 @@ impl FontSystem {
             #[cfg(feature = "shape-run-cache")]
             shape_run_cache: crate::ShapeRunCache::default(),
             shape_buffer: ShapeBuffer::default(),
-            dyn_fallback: Box::new(impl_fallback),
+            dyn_fallback,
             fallbacks,
         }
     }
 
+    /// Create a new [`FontSystem`] with a pre-specified locale, font database and font fallback list.
+    ///
+    /// The database is used as-is: no system fonts are loaded into it and the font families it has
+    /// configured are left untouched.
+    pub fn new_with_locale_and_db_and_fallback(
+        locale: String,
+        db: fontdb::Database,
+        impl_fallback: impl Fallback + 'static,
+    ) -> Self {
+        Self::builder()
+            .locale(Some(locale))
+            .database(Some(db))
+            .fallback(impl_fallback)
+            .build()
+    }
+
     /// Create a new [`FontSystem`] with a pre-specified locale and font database.
+    ///
+    /// The database is used as-is: no system fonts are loaded into it and the font families it has
+    /// configured are left untouched.
     pub fn new_with_locale_and_db(locale: String, db: fontdb::Database) -> Self {
-        Self::new_with_locale_and_db_and_fallback(locale, db, PlatformFallback)
+        Self::builder()
+            .locale(Some(locale))
+            .database(Some(db))
+            .build()
     }
 
     /// Get the locale.
@@ -508,29 +851,24 @@ impl FontSystem {
         String::from("en-US")
     }
 
-    #[cfg(feature = "std")]
-    fn load_fonts(db: &mut fontdb::Database, fonts: impl Iterator<Item = fontdb::Source>) {
-        #[cfg(not(target_arch = "wasm32"))]
-        let now = std::time::Instant::now();
-
-        db.load_system_fonts();
-
-        for source in fonts {
-            db.load_font_source(source);
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        log::debug!(
-            "Parsed {} font faces in {}ms.",
-            db.len(),
-            now.elapsed().as_millis()
-        );
-    }
-
-    #[cfg(not(feature = "std"))]
-    fn load_fonts(db: &mut fontdb::Database, fonts: impl Iterator<Item = fontdb::Source>) {
-        for source in fonts {
-            db.load_font_source(source);
+    /// Load the system fonts into `db`, going through the persistent on-disk index cache when
+    /// one is configured.
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    fn load_system_fonts(db: &mut fontdb::Database, cache: &SystemFontsCache) {
+        match cache {
+            SystemFontsCache::Disabled => db.load_system_fonts(),
+            SystemFontsCache::DefaultPath => match super::cache::default_cache_path() {
+                Some(cache_path) => super::cache::load_system_fonts_cached(db, &cache_path),
+                None => {
+                    log::warn!(
+                        "failed to determine a font cache path, loading system fonts uncached"
+                    );
+                    db.load_system_fonts();
+                }
+            },
+            SystemFontsCache::Path(cache_path) => {
+                super::cache::load_system_fonts_cached(db, cache_path);
+            }
         }
     }
 }
@@ -553,5 +891,75 @@ impl<T> Deref for BorrowedWithFontSystem<'_, T> {
 impl<T> DerefMut for BorrowedWithFontSystem<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod test {
+    use super::{fontdb, FontSystem};
+    use fontdb::Family;
+
+    #[test]
+    fn builder_applies_the_default_families() {
+        let font_system = FontSystem::builder()
+            .load_system_fonts(false)
+            .locale(Some("fr-FR"))
+            .build();
+
+        assert_eq!(font_system.locale(), "fr-FR");
+
+        let db = font_system.db();
+        assert_eq!(db.family_name(&Family::Monospace), "Noto Sans Mono");
+        assert_eq!(db.family_name(&Family::SansSerif), "Open Sans");
+        assert_eq!(db.family_name(&Family::Serif), "DejaVu Serif");
+    }
+
+    #[test]
+    fn builder_overrides_the_default_families() {
+        let font_system = FontSystem::builder()
+            .load_system_fonts(false)
+            .monospace_family("Custom Mono")
+            .sans_serif_family("Custom Sans")
+            .serif_family("Custom Serif")
+            .build();
+
+        let db = font_system.db();
+        assert_eq!(db.family_name(&Family::Monospace), "Custom Mono");
+        assert_eq!(db.family_name(&Family::SansSerif), "Custom Sans");
+        assert_eq!(db.family_name(&Family::Serif), "Custom Serif");
+    }
+
+    /// A database provided by the caller is used as-is: no system fonts are loaded into it and
+    /// the families it has configured are kept.
+    #[test]
+    fn a_provided_database_is_used_as_is() {
+        let mut db = fontdb::Database::new();
+        db.set_monospace_family("Provided Mono");
+
+        let font_system = FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let db = font_system.db();
+
+        assert_eq!(font_system.locale(), "en-US");
+        assert_eq!(db.len(), 0);
+        assert_eq!(db.family_name(&Family::Monospace), "Provided Mono");
+        // fontdb's own default, not the one the builder applies to a database it creates.
+        assert_eq!(db.family_name(&Family::Serif), "Times New Roman");
+    }
+
+    /// The defaults a provided database opts out of can still be requested one by one.
+    #[test]
+    fn a_provided_database_can_still_be_configured() {
+        let mut db = fontdb::Database::new();
+        db.set_monospace_family("Provided Mono");
+
+        let font_system = FontSystem::builder()
+            .database(Some(db))
+            .monospace_family("Custom Mono")
+            .build();
+
+        assert_eq!(
+            font_system.db().family_name(&Family::Monospace),
+            "Custom Mono"
+        );
     }
 }

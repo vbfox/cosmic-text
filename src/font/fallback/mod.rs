@@ -28,7 +28,8 @@ mod platform;
 
 /// The `Fallback` trait allows for configurable font fallback lists to be set during construction of the [`FontSystem`].
 ///
-/// A custom fallback list can be added via the [`FontSystem::new_with_locale_and_db_and_fallback`] constructor.
+/// A custom fallback list can be added via the [`FontSystem::new_with_locale_and_db_and_fallback`] constructor,
+/// or with the [`fallback`](crate::FontSystemBuilder::fallback) option of [`FontSystem::builder`].
 ///
 /// A default implementation is provided by the [`PlatformFallback`] struct, which encapsulates the target platform's pre-configured fallback lists.
 ///
